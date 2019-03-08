@@ -17,6 +17,7 @@ WD = 1e-5               # Weight decay
 UPDATE_EVERY = 4        # how often to update the network
 A = 0.95                # randomness vs priority
 P_EPS = 1e-04           # priority epsilon
+CLIP = 10               # gradient clipping
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -108,6 +109,7 @@ class Agent():
 
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm(optimizer.parameters(), CLIP)
         self.optimizer.step()
 
         # ------------------- update target network ------------------- #
