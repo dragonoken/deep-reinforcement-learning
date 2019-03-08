@@ -13,6 +13,7 @@ BATCH_SIZE = 64         # minibatch size
 GAMMA = 0.99            # discount factor
 TAU = 1e-3              # for soft update of target parameters
 LR = 1e-3               # learning rate
+WD = 1e-5               # Weight decay
 UPDATE_EVERY = 4        # how often to update the network
 A = 0.95                # randomness vs priority
 P_EPS = 1e-04           # priority epsilon
@@ -40,7 +41,7 @@ class Agent():
         # Q-Network
         self.qnetwork_local = QNetwork(state_size, action_size, seed).to(device)
         self.qnetwork_target = QNetwork(state_size, action_size, seed).to(device)
-        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=LR)
+        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=LR, weight_decay=WD)
 
         # Replay memory
         self.memory = ReplayBuffer(action_size, BUFFER_SIZE, BATCH_SIZE, seed)
