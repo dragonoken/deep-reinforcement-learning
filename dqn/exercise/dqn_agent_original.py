@@ -7,20 +7,17 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from model import QNetwork
-
-BUFFER_SIZE = int(1e5)  # replay buffer size
-BATCH_SIZE = 64         # minibatch size
-GAMMA = 0.99            # discount factor
-TAU = 1e-3              # for soft update of target parameters
-LR = 5e-4               # learning rate
-UPDATE_EVERY = 4        # how often to update the network
+from default_hyperparameters import SEED, BUFFER_SIZE, BATCH_SIZE, START_SINCE, GAMMA,\
+                                    T_UPDATE, TAU, LR, WEIGHT_DECAY, UPDATE_EVERY, CLIP
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class Agent():
     """Interacts with and learns from the environment."""
 
-    def __init__(self, state_size, action_size, seed):
+    def __init__(self, state_size, action_size, seed=SEED, batch_size=BATCH_SIZE,
+                 buffer_size=BUFFER_SIZE, start_since=START_SINCE, gamma=GAMMA, target_update_every=T_UPDATE,
+                 tau=TAU, lr=LR, weight_decay=WEIGHT_DECAY, update_every=UPDATE_EVERY, clip=CLIP, **kwds):
         """Initialize an Agent object.
 
         Params
@@ -28,19 +25,58 @@ class Agent():
             state_size (int): dimension of each state
             action_size (int): dimension of each action
             seed (int): random seed
+            batch_size (int): size of each sample batch
+            buffer_size (int): size of the experience memory buffer
+            start_since (int): number of steps to collect before start training
+            gamma (float): discount factor
+            target_update_every (int): how often to update the target network
+            tau (float): target network soft-update parameter
+            lr (float): learning rate
+            weight_decay (float): weight decay for optimizer
+            update_every (int): update(learning and target update) interval
+            clip (float): gradient norm clipping (`None` to disable)
         """
-        self.state_size = state_size
-        self.action_size = action_size
-        self.seed = random.seed(seed)
+        if kwds != {}:
+            print("Ignored keyword arguments: ", end='')
+            print(*kwds, sep=', ')
+        assert isinstance(state_size, int)
+        assert isinstance(action_size, int)
+        assert isinstance(seed, int)
+        assert isinstance(batch_size, int) and batch_size > 0
+        assert isinstance(buffer_size, int) and buffer_size >= batch_size
+        assert isinstance(start_since, int) and batch_size <= start_since <= buffer_size
+        assert isinstance(gamma, (int, float)) and 0 <= gamma <= 1
+        assert isinstance(target_update_every, int) and target_update_every > 0
+        assert isinstance(tau, (int, float)) and 0 <= tau <= 1
+        assert isinstance(lr, (int, float)) and lr >= 0
+        assert isinstance(weight_decay, (int, float)) and weight_decay >= 0
+        assert isinstance(update_every, int) and update_every > 0
+        if clip: assert isinstance(clip, (int, float)) and clip >= 0
+
+        self.state_size          = state_size
+        self.action_size         = action_size
+        self.seed                = random.seed(seed)
+        self.batch_size          = batch_size
+        self.buffer_size         = buffer_size
+        self.start_since         = start_since
+        self.gamma               = gamma
+        self.target_update_every = target_update_every
+        self.tau                 = tau
+        self.lr                  = lr
+        self.weight_decay        = weight_decay
+        self.update_every        = update_every
 
         # Q-Network
-        self.qnetwork_local = QNetwork(state_size, action_size, seed).to(device)
+        self.qnetwork_local  = QNetwork(state_size, action_size, seed).to(device)
         self.qnetwork_target = QNetwork(state_size, action_size, seed).to(device)
-        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=LR)
+        self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
+
+        self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=lr, weight_decay=weight_decay)
 
         # Replay memory
-        self.memory = ReplayBuffer(action_size, BUFFER_SIZE, BATCH_SIZE, seed)
-        # Initialize time step (for updating every UPDATE_EVERY steps)
+        self.memory = ReplayBuffer(action_size, buffer_size, batch_size, seed)
+        # Initialize time step (for updating every UPDATE_EVERY steps and TARGET_UPDATE_EVERY steps)
+        self.u_step = 0
         self.t_step = 0
 
     def step(self, state, action, reward, next_state, done):
@@ -48,12 +84,17 @@ class Agent():
         self.memory.add(state, action, reward, next_state, done)
 
         # Learn every UPDATE_EVERY time steps.
-        self.t_step = (self.t_step + 1) % UPDATE_EVERY
-        if self.t_step == 0:
+        self.u_step = (self.u_step + 1) % self.update_every
+        if self.u_step == 0:
             # If enough samples are available in memory, get random subset and learn
-            if len(self.memory) > BATCH_SIZE:
+            if len(self.memory) >= self.start_since:
                 experiences = self.memory.sample()
                 self.learn(experiences, GAMMA)
+
+        # update the target network every TARGET_UPDATE_EVERY time steps.
+        self.t_step = (self.t_step + 1) % self.target_update_every
+        if self.t_step == 0:
+            self.soft_update(self.qnetwork_local, self.qnetwork_target, self.tau)
 
     def act(self, state, eps=0.):
         """Returns actions for given state as per current policy.
@@ -93,10 +134,9 @@ class Agent():
 
         self.optimizer.zero_grad()
         loss.backward()
+        if self.clip:
+            torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), CLIP)
         self.optimizer.step()
-
-        # ------------------- update target network ------------------- #
-        self.soft_update(self.qnetwork_local, self.qnetwork_target, TAU)
 
     def soft_update(self, local_model, target_model, tau):
         """Soft update model parameters.
@@ -140,11 +180,11 @@ class ReplayBuffer:
         """Randomly sample a batch of experiences from memory."""
         experiences = random.sample(self.memory, k=self.batch_size)
 
-        states = torch.from_numpy(np.vstack([e.state for e in experiences if e is not None])).float().to(device)
-        actions = torch.from_numpy(np.vstack([e.action for e in experiences if e is not None])).long().to(device)
-        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences if e is not None])).float().to(device)
-        next_states = torch.from_numpy(np.vstack([e.next_state for e in experiences if e is not None])).float().to(device)
-        dones = torch.from_numpy(np.vstack([e.done for e in experiences if e is not None]).astype(np.uint8)).float().to(device)
+        states = torch.from_numpy(np.array([e.state for e in experiences if e is not None])).float().to(device)
+        actions = torch.from_numpy(np.array([e.action for e in experiences if e is not None]).reshape((-1, 1))).long().to(device)
+        rewards = torch.from_numpy(np.array([e.reward for e in experiences if e is not None]).reshape((-1, 1))).float().to(device)
+        next_states = torch.from_numpy(np.array([e.next_state for e in experiences if e is not None])).float().to(device)
+        dones = torch.from_numpy(np.array([e.done for e in experiences if e is not None], dtype=np.uint8).reshape((-1, 1))).float().to(device)
 
         return (states, actions, rewards, next_states, dones)
 

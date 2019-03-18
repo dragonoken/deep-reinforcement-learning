@@ -6,10 +6,11 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-from model import QNetwork
+from model_distributional import QNetwork
 from default_hyperparameters import SEED, BUFFER_SIZE, BATCH_SIZE, START_SINCE,\
                                     GAMMA, T_UPDATE, TAU, LR, WEIGHT_DECAY, UPDATE_EVERY,\
-                                    A, INIT_BETA, P_EPS, CLIP
+                                    A, INIT_BETA, P_EPS, N_STEPS, V_MIN, V_MAX,\
+                                    CLIP, N_ATOMS, INIT_SIGMA, LINEAR
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -19,7 +20,9 @@ class Agent():
     def __init__(self, state_size, action_size, seed=SEED, batch_size=BATCH_SIZE,
                  buffer_size=BUFFER_SIZE, start_since=START_SINCE, gamma=GAMMA, target_update_every=T_UPDATE,
                  tau=TAU, lr=LR, weight_decay=WEIGHT_DECAY, update_every=UPDATE_EVERY, priority_eps=P_EPS,
-                 a=A, initial_beta=INIT_BETA, clip=CLIP, **kwds):
+                 a=A, initial_beta=INIT_BETA, n_multisteps=N_STEPS,
+                 v_min=V_MIN, v_max=V_MAX, clip=CLIP, n_atoms=N_ATOMS,
+                 initial_sigma=INIT_SIGMA, linear_type=LINEAR, **kwds):
         """Initialize an Agent object.
 
         Params
@@ -39,7 +42,13 @@ class Agent():
             priority_eps (float): small base value for priorities
             a (float): priority exponent parameter
             initial_beta (float): initial importance-sampling weight
+            n_multisteps (int): number of steps to consider for each experience
+            v_min (float): minimum reward support value
+            v_max (float): maximum reward support value
             clip (float): gradient norm clipping (`None` to disable)
+            n_atoms (int): number of atoms in the discrete support distribution
+            initial_sigma (float): initial noise parameter weights
+            linear_type (str): one of ('linear', 'noisy'); type of linear layer to use
         """
         if kwds != {}:
             print("Ignored keyword arguments: ", end='')
@@ -59,7 +68,12 @@ class Agent():
         assert isinstance(priority_eps, (int, float)) and priority_eps >= 0
         assert isinstance(a, (int, float)) and 0 <= a <= 1
         assert isinstance(initial_beta, (int, float)) and 0 <= initial_beta <= 1
+        assert isinstance(n_multisteps, int) and n_multisteps > 0
+        assert isinstance(v_min, (int, float)) and isinstance(v_max, (int, float)) and v_min < v_max
         if clip: assert isinstance(clip, (int, float)) and clip >= 0
+        assert isinstance(n_atoms, int) and n_atoms > 0
+        assert isinstance(initial_sigma, (int, float)) and initial_sigma >= 0
+        assert isinstance(linear_type, str) and linear_type.strip().lower() in ('linear', 'noisy')
 
         self.state_size          = state_size
         self.action_size         = action_size
@@ -76,17 +90,27 @@ class Agent():
         self.priority_eps        = priority_eps
         self.a                   = a
         self.beta                = initial_beta
+        self.n_multisteps        = n_multisteps
+        self.v_min               = v_min
+        self.v_max               = v_max
         self.clip                = clip
+        self.n_atoms             = n_atoms
+        self.initial_sigma       = initial_sigma
+        self.linear_type         = linear_type.strip().lower()
+
+        # Distribution
+        self.supports = torch.linspace(v_min, v_max, n_atoms, device=device)
+        self.delta_z  = (v_max - v_min) / (n_atoms - 1)
 
         # Q-Network
-        self.qnetwork_local  = QNetwork(state_size, action_size, seed).to(device)
-        self.qnetwork_target = QNetwork(state_size, action_size, seed).to(device)
+        self.qnetwork_local  = QNetwork(state_size, action_size, n_atoms, linear_type, initial_sigma, seed).to(device)
+        self.qnetwork_target = QNetwork(state_size, action_size, n_atoms, linear_type, initial_sigma, seed).to(device)
         self.qnetwork_target.load_state_dict(self.qnetwork_local.state_dict())
 
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=lr, weight_decay=weight_decay)
 
         # Replay memory
-        self.memory = ReplayBuffer(action_size, buffer_size, batch_size, a, seed)
+        self.memory = ReplayBuffer(action_size, buffer_size, batch_size, n_multisteps, gamma, a, seed)
         # Initialize time step (for updating every UPDATE_EVERY steps and TARGET_UPDATE_EVERY steps)
         self.u_step = 0
         self.t_step = 0
@@ -100,8 +124,8 @@ class Agent():
         if self.u_step == 0:
             # If enough samples are available in memory, get random subset and learn
             if len(self.memory) >= self.start_since:
-                experiences, is_weights, indices = self.memory.sample(self.beta)
-                new_priorities = self.learn(experiences, is_weights, self.gamma)
+                experiences, target_discount, is_weights, indices = self.memory.sample(self.beta)
+                new_priorities = self.learn(experiences, is_weights, target_discount)
                 self.memory.update_priorities(indices, new_priorities)
 
         # update the target network every TARGET_UPDATE_EVERY time steps.
@@ -118,10 +142,9 @@ class Agent():
             eps (float): epsilon, for epsilon-greedy action selection
         """
         state = torch.from_numpy(state).float().unsqueeze(0).to(device)
-        self.qnetwork_local.eval()
         with torch.no_grad():
-            action_values = self.qnetwork_local(state)
-        self.qnetwork_local.train()
+            z_probs       = self.qnetwork_local(state).softmax(dim=-1)
+            action_values = self.supports.mul(z_probs).sum(dim=-1, keepdim=False)
 
         # Epsilon-greedy action selection
         if random.random() > eps:
@@ -135,7 +158,7 @@ class Agent():
         ======
             experiences (Tuple[torch.Tensor]): tuple of (s, a, r, s', done) tuples
             is_weights (torch.Tensor): tensor of importance-sampling weights
-            gamma (float): discount factor
+            gamma (float): discount factor for the target max-Q value
 
         Returns
         =======
@@ -144,20 +167,61 @@ class Agent():
         states, actions, rewards, next_states, dones = experiences
 
         with torch.no_grad():
-            target = rewards + gamma * (1 - dones) * self.qnetwork_target(next_states)\
-                                                         .gather(dim=1, index=self.qnetwork_local(next_states)\
-                                                                                  .argmax(dim=1, keepdim=True))
+            rows         = tuple(range(next_states.size(0)))
+            a_argmax     = self.qnetwork_local(next_states)\
+                               .softmax(dim=2)\
+                               .mul(self.supports)\
+                               .sum(dim=2, keepdim=False)\
+                               .argmax(dim=1, keepdim=False)
+            p            = self.qnetwork_target(next_states)[rows, a_argmax].softmax(dim=1)
+            tz_projected = torch.clamp(rewards + (1 - dones) * gamma * self.supports, min=self.v_min, max=self.v_max)
+            # """
+            b            = (tz_projected - self.v_min) / self.delta_z
+            u            = b.ceil()
+            l            = b.floor()
+            u_updates    = b - l + u.eq(l).type(u.dtype) # fixes the problem when having b == u == l
+            l_updates    = u - b
+            indices_flat = torch.cat((u.long(), l.long()), dim=1)
+            indices_flat = indices_flat.add(
+                               torch.arange(start=0,
+                                            end=b.size(0) * b.size(1),
+                                            step=b.size(1),
+                                            dtype=indices_flat.dtype,
+                                            layout=indices_flat.layout,
+                                            device=indices_flat.device).unsqueeze(1)
+                           ).view(-1)
+            updates_flat = torch.cat((u_updates.mul(p), l_updates.mul(p)), dim=1).view(-1)
+            target_distributions = torch.zeros_like(p)
+            target_distributions.view(-1).index_add_(0, indices_flat, updates_flat)
+            """
+            b = ((tz_projected - V_MIN) / self.delta_z).t() # transpose for later for-loop convenience
+            u = b.ceil()
+            l = b.floor()
+            u_updates = b - l + u.eq(l).type(u.dtype)
+            l_updates = u - b
+            target_distributions = torch.zeros_like(p)
+            for u_indices, l_indices, u_update, l_update, prob in zip(u.long(), l.long(), u_updates, l_updates, p.t()):
+                target_distributions[rows, u_indices] += u_update * prob
+                target_distributions[rows, l_indices] += l_update * prob
+            """
 
-        pred = self.qnetwork_local(states)
+        pred_distributions = self.qnetwork_local(states)
+        pred_distributions = pred_distributions.gather(dim=1, index=actions.unsqueeze(1).expand(-1, -1, pred_distributions.size(2))).squeeze(1)
 
-        diff = target.sub(pred.gather(dim=1, index=actions))
-        new_priorities = diff.detach().abs().add(P_EPS).cpu().numpy().reshape((-1,))
-        loss = diff.pow(2).mul(is_weights).mean()
+        # """
+        cross_entropy = target_distributions.mul(pred_distributions.logsumexp(dim=-1, keepdim=True) - pred_distributions).sum(dim=-1, keepdim=False)
+        new_priorities = cross_entropy.detach().add(self.priority_eps).cpu().numpy()
+        loss = cross_entropy.mul(is_weights.view(-1)).mean()
+        """
+        kl_divergence = F.kl_div(pred_distributions.log_softmax(dim=-1), target_distributions, reduction='none').sum(dim=-1, keepdim=False)
+        new_priorities = kl_divergence.detach().add(self.priority_eps).cpu().numpy()
+        loss = kl_divergence.mul(is_weights.view(-1)).mean()
+        """
 
         self.optimizer.zero_grad()
         loss.backward()
         if self.clip:
-            torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), CLIP)
+            torch.nn.utils.clip_grad_norm_(self.qnetwork_local.parameters(), self.clip)
         self.optimizer.step()
 
         return new_priorities
@@ -179,7 +243,7 @@ class Agent():
 class ReplayBuffer:
     """Fixed-size buffer to store experience tuples."""
 
-    def __init__(self, action_size, buffer_size, batch_size, a, seed):
+    def __init__(self, action_size, buffer_size, batch_size, n_multisteps, gamma, a, seed):
         """Initialize a ReplayBuffer object.
 
         Params
@@ -187,30 +251,33 @@ class ReplayBuffer:
             action_size (int): dimension of each action
             buffer_size (int): maximum size of buffer
             batch_size (int): size of each training batch
+            n_multisteps (int): number of time steps to consider for each experience
+            gamma (float): discount factor
             a (float): priority exponent parameter
             seed (int): random seed
         """
         self.action_size = action_size
         self.buffer_size = buffer_size
         self.batch_size = batch_size
+        self.n_multisteps = n_multisteps
+        self.gamma = gamma
         self.a = a
         self.memory = deque(maxlen=buffer_size)
-        self.priorities = deque(maxlen=buffer_size)
-        self._priorities_a = deque(maxlen=buffer_size)
-        self._p_a_sum = 0
-        self._max_priority = 1.
+        self.priorities_a = deque(maxlen=buffer_size)
+        self.multistep_collector = deque(maxlen=n_multisteps)
+        self.max_priority_a = 1.
         self.experience = namedtuple("Experience", field_names=["state", "action", "reward", "next_state", "done"])
         self.seed = random.seed(seed)
 
     def add(self, state, action, reward, next_state, done):
         """Add a new experience to memory."""
         e = self.experience(state, action, reward, next_state, done)
-        self.memory.append(e)
-        self.priorities.append(self.max_priority)
-        if len(self._priorities_a) == self.buffer_size:
-            self._p_a_sum -= self._priorities_a.popleft()
-        self._priorities_a.append(self._max_priority ** self.a)
-        self._p_a_sum += self._priorities_a[-1]
+        self.multistep_collector.append(e)
+        if len(self.multistep_collector) == self.n_multisteps:
+            self.memory.append(tuple(self.multistep_collector))
+            self.priorities_a.append(self.max_priority_a)
+        if done:
+            self.multistep_collector.clear()
 
     def sample(self, beta):
         """Randomly sample a batch of experiences from memory.
@@ -222,25 +289,36 @@ class ReplayBuffer:
         Returns
         =======
             experiences (Tuple[torch.Tensor]): tuple of (s, a, r, s', done) tuples
+            target_discount (float): discount factor for target max-Q value
             is_weights (torch.Tensor): tensor of importance-sampling weights
             indices (np.ndarray): sample indices"""
-        probs = np.divide(self._priorities_a, self._p_a_sum)
+        probs = np.divide(self.priorities_a, sum(self.priorities_a))
 
         indices = np.random.choice(len(self.memory), size=self.batch_size, replace=False, p=probs)
 
-        states, actions, rewards, next_states, dones = zip(*[self.memory[i] for i in indices if self.memory[i] is not None])
+        discounts = np.power(self.gamma, np.arange(self.n_multisteps + 1))
+        target_discount = float(discounts[-1])
+
+        experiences = tuple(zip(*[self.memory[i] for i in indices if self.memory[i] is not None]))
+
+
+        first_states = torch.from_numpy(np.array([e[0] for e in experiences[0]])).float().to(device)
+        actions = torch.from_numpy(np.array([e[1] for e in experiences[0]]).reshape((-1, 1))).long().to(device)
+        rewards = torch.from_numpy(
+                      np.sum(
+                          np.multiply(
+                              np.array([[e[2] for e in experiences_step] for experiences_step in experiences]).transpose(), discounts[:-1]
+                          ), axis=1, keepdims=True
+                      )
+                  ).float().to(device)
+        last_states = torch.from_numpy(np.array([e[3] for e in experiences[-1]])).float().to(device)
+        dones = torch.from_numpy(np.array([e[4] for e in experiences[-1]], dtype=np.uint8).reshape((-1, 1))).float().to(device)
+
         is_weights = [probs[i] for i in indices if self.memory[i] is not None]
-
-        states = torch.from_numpy(np.array(states)).float().to(device)
-        actions = torch.from_numpy(np.array(actions).reshape((-1, 1))).long().to(device)
-        rewards = torch.from_numpy(np.array(rewards).reshape((-1, 1))).float().to(device)
-        next_states = torch.from_numpy(np.array(next_states)).float().to(device)
-        dones = torch.from_numpy(np.array(dones, dtype=np.uint8).reshape((-1, 1))).float().to(device)
-
         is_weights = np.power(np.multiply(is_weights, len(self.memory)), -beta)
         is_weights = torch.from_numpy(np.divide(is_weights, max(is_weights)).reshape((-1, 1))).float().to(device)
 
-        return (states, actions, rewards, next_states, dones), is_weights, indices
+        return (first_states, actions, rewards, last_states, dones), target_discount, is_weights, indices
 
     def update_priorities(self, indices, new_priorities):
         """Update the priorities for the experiences of given indices to the given new values.
@@ -249,12 +327,13 @@ class ReplayBuffer:
         ======
             indices (array_like): indices of experience priorities to update
             new_priorities (array-like): new priority values for given indices"""
-        for i, new_priority in zip(indices, new_priorities):
-            self.priorities[i] = new_priority
-            old_priority_a = self._priorities_a[i]
-            self._priorities_a[i] = new_priority ** self.a
-            self._p_a_sum = self._p_a_sum - old_priority_a + self._priorities_a[i]
-        self._max_priority = max(self.priorities)
+        new_priorities_a = np.power(new_priorities, self.a)
+        for i, new_priority_a in zip(indices, new_priorities_a):
+            self.priorities_a[i] = float(new_priority_a)
+        self.max_priority_a = max(self.priorities_a)
+
+    def reset_multisteps(self):
+        self.multistep_collector.clear()
 
     def __len__(self):
         """Return the current size of internal memory."""
